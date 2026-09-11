@@ -1,0 +1,4 @@
+.DS_Store
+native/__pycache__/
+mysub-*.zip
+mysub
