@@ -14,6 +14,7 @@ async function init() {
   renderDownloads(downloadBatch, {});   // placeholder chips; fetchStatus will refresh them
   setStatusFromStats(lastScrapeStats, Object.keys(channels).length);
   initSettings(newThresholdHours);
+  pushChannelNames(channels, downloadBatch);
   fetchStatus();
   setInterval(fetchStatus, 15000);
 
@@ -399,6 +400,20 @@ function showToast(message) {
   toast.textContent = message;
   toast.classList.add('visible');
   setTimeout(() => toast.classList.remove('visible'), 3200);
+}
+
+// Build {videoId: channelName} from both storage sources and push to native host
+// so the uploader can stamp source_channel on new uploads and backfill existing ones.
+function pushChannelNames(channels, downloadBatch) {
+  const map = {};
+  for (const entry of Object.values(channels)) {
+    if (entry.videoId && entry.channelName) map[entry.videoId] = entry.channelName;
+  }
+  for (const entry of Object.values(downloadBatch)) {
+    if (entry.videoId && entry.channelName) map[entry.videoId] = entry.channelName;
+  }
+  if (Object.keys(map).length === 0) return;
+  chrome.runtime.sendMessage({ type: 'PUSH_CHANNEL_NAMES', map }).catch(() => {});
 }
 
 document.addEventListener('DOMContentLoaded', init);

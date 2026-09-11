@@ -315,6 +315,29 @@ def main():
 
         send({'status': 'ok', 'statuses': statuses, 'titles': titles})
 
+    elif action == 'push_channel_names':
+        # Merge incoming {videoId: channelName} map into the persistent lookup file.
+        incoming = msg.get('map', {})
+        if incoming:
+            cache_dir = os.path.expanduser('~/Library/Application Support/MySub')
+            names_file = os.path.join(cache_dir, 'channel_names.json')
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+                existing = {}
+                try:
+                    with open(names_file) as f:
+                        existing = json.load(f)
+                except Exception:
+                    pass
+                existing.update(incoming)
+                tmp = names_file + '.tmp'
+                with open(tmp, 'w') as f:
+                    json.dump(existing, f)
+                os.replace(tmp, names_file)
+            except Exception:
+                pass
+        send({'status': 'ok'})
+
     elif action == 'download_transcript':
         url = msg.get('url', '')
         if not url:

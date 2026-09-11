@@ -37,8 +37,9 @@ LOCK_FILE         = os.path.join(DOWNLOAD_DIR, 'uploader.lock')
 QUEUE_PREFIX      = os.path.join(DOWNLOAD_DIR, 'mysub_queue')
 
 # Status cache: written here (full filesystem access), read by native host (sandboxed)
-STATUS_CACHE_DIR  = os.path.expanduser('~/Library/Application Support/MySub')
-STATUS_CACHE_FILE = os.path.join(STATUS_CACHE_DIR, 'status_cache.json')
+STATUS_CACHE_DIR   = os.path.expanduser('~/Library/Application Support/MySub')
+STATUS_CACHE_FILE  = os.path.join(STATUS_CACHE_DIR, 'status_cache.json')
+CHANNEL_NAMES_FILE = os.path.join(STATUS_CACHE_DIR, 'channel_names.json')
 FFPROBE      = '/opt/homebrew/bin/ffprobe'
 FFMPEG       = '/opt/homebrew/bin/ffmpeg'
 STABLE_SECS  = 60    # file must be unmodified this long before upload
@@ -54,6 +55,8 @@ def log(msg):
         print(line, flush=True)
 
 
+MAX_UPLOAD_MB_DEFAULT = 500
+
 def load_config():
     if not os.path.exists(CONFIG_FILE):
         return None
@@ -61,6 +64,7 @@ def load_config():
         with open(CONFIG_FILE) as f:
             cfg = json.load(f)
         if cfg.get('wetube_url') and cfg.get('upload_key'):
+            cfg.setdefault('max_upload_mb', MAX_UPLOAD_MB_DEFAULT)
             return cfg
     except Exception:
         pass
@@ -401,7 +405,7 @@ def put_bytes(url_str, data, content_type, extra_headers=None):
 
 
 def stream_put(url_str, file_path, extra_headers=None):
-    """Stream a file to a presigned PUT URL in 8 MB chunks (no full-file memory load)."""
+    """Stream a file to a presigned PUT URL in 8 MB chunks, with up to 3 attempts."""
     parsed = urllib.parse.urlparse(url_str)
     size = os.path.getsize(file_path)
     headers = {
@@ -409,42 +413,86 @@ def stream_put(url_str, file_path, extra_headers=None):
         'Content-Length': str(size),
         **(extra_headers or {}),
     }
-    if parsed.scheme == 'https':
-        conn = http.client.HTTPSConnection(parsed.netloc, timeout=600, context=_SSL_CTX)
-    else:
-        conn = http.client.HTTPConnection(parsed.netloc, timeout=600)
-
     path_qs = parsed.path + ('?' + parsed.query if parsed.query else '')
-    conn.putrequest('PUT', path_qs)
-    for k, v in headers.items():
-        conn.putheader(k, v)
-    conn.endheaders()
 
-    with open(file_path, 'rb') as f:
-        while True:
-            chunk = f.read(8 * 1024 * 1024)
-            if not chunk:
-                break
-            conn.send(chunk)
-
-    resp = conn.getresponse()
-    status = resp.status
-    resp.read()
-    conn.close()
-    return status
+    last_exc = None
+    for attempt in range(3):
+        try:
+            if parsed.scheme == 'https':
+                conn = http.client.HTTPSConnection(parsed.netloc, timeout=7200, context=_SSL_CTX)
+            else:
+                conn = http.client.HTTPConnection(parsed.netloc, timeout=7200)
+            conn.putrequest('PUT', path_qs)
+            for k, v in headers.items():
+                conn.putheader(k, v)
+            conn.endheaders()
+            with open(file_path, 'rb') as f:
+                while True:
+                    chunk = f.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    conn.send(chunk)
+            resp = conn.getresponse()
+            status = resp.status
+            resp.read()
+            conn.close()
+            return status
+        except Exception as e:
+            last_exc = e
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if attempt < 2:
+                wait = 60 * (attempt + 1)
+                log(f"PUT attempt {attempt + 1} failed ({e}), retrying in {wait}s…")
+                time.sleep(wait)
+    raise last_exc
 
 
 def read_sidecar(path):
-    """Read the .info.json sidecar written by the native host for this video, if any."""
+    """Return channel metadata for this video from sidecar or channel_names.json fallback."""
     m = re.search(r' - ([A-Za-z0-9_-]{11})\.[^.]+$', os.path.basename(path))
     if not m:
         return {}
-    sidecar = os.path.join(DOWNLOAD_DIR, f'mysub_{m.group(1)}.info.json')
+    vid_id = m.group(1)
+    sidecar = os.path.join(DOWNLOAD_DIR, f'mysub_{vid_id}.info.json')
     try:
         with open(sidecar) as f:
-            return json.load(f)
+            data = json.load(f)
+        if data.get('channelName'):
+            return data
     except Exception:
-        return {}
+        pass
+    # Fallback: channel_names.json written by native host from extension storage
+    try:
+        with open(CHANNEL_NAMES_FILE) as f:
+            names = json.load(f)
+        name = names.get(vid_id, '')
+        if name:
+            return {'channelName': name}
+    except Exception:
+        pass
+    return {}
+
+
+def backfill_channel_names(cfg):
+    """POST known {videoId: channelName} pairs to WeTube to fill NULL source_channel rows."""
+    try:
+        with open(CHANNEL_NAMES_FILE) as f:
+            names = json.load(f)
+    except Exception:
+        return
+    if not names:
+        return
+    base_url = cfg['wetube_url'].rstrip('/')
+    try:
+        result = api_post(base_url, '/api/uploads/mysub-backfill-channels', cfg['upload_key'],
+                          {'map': names})
+        if result.get('updated', 0) > 0:
+            log(f"backfilled source_channel for {result['updated']} video(s)")
+    except Exception as e:
+        log(f"backfill failed: {e}")
 
 
 def upload_file(path, cfg):
@@ -461,21 +509,30 @@ def upload_file(path, cfg):
     sidecar     = read_sidecar(path)
     channel_name = sidecar.get('channelName', '').strip()
 
-    # 1 — get presigned PUT URLs from WeTube (source + thumb)
-    try:
-        presign_body = {
-            'title':    title,
-            'filename': os.path.basename(path),
-            'size':     size,
-            'width':    width,
-            'height':   height,
-        }
-        if channel_name:
-            presign_body['channelName'] = channel_name
-        presign = api_post(base_url, '/api/uploads/mysub-presign', key, presign_body)
-    except Exception as e:
-        log(f"presign failed for '{title}': {e}")
-        return False
+    # 1 — get presigned PUT URLs from WeTube (source + thumb), retry on transient errors
+    presign_body = {
+        'title':    title,
+        'filename': os.path.basename(path),
+        'size':     size,
+        'width':    width,
+        'height':   height,
+    }
+    if channel_name:
+        presign_body['channelName'] = channel_name
+
+    presign = None
+    for attempt in range(3):
+        try:
+            presign = api_post(base_url, '/api/uploads/mysub-presign', key, presign_body)
+            break
+        except Exception as e:
+            if attempt < 2:
+                wait = 30 * (attempt + 1)
+                log(f"presign attempt {attempt + 1} failed for '{title}' ({e}), retrying in {wait}s…")
+                time.sleep(wait)
+            else:
+                log(f"presign failed for '{title}': {e}")
+                return False
 
     video_id    = presign.get('videoId')
     put_url     = presign.get('url')
@@ -588,11 +645,19 @@ def main():
             time.sleep(POLL_SECS)
             continue
 
+        max_bytes = int(cfg.get('max_upload_mb', MAX_UPLOAD_MB_DEFAULT)) * 1024 * 1024
         for path in sorted(glob.glob(os.path.join(DOWNLOAD_DIR, '*.mp4'))):
             name = os.path.basename(path)
             if name in uploaded:
                 continue
             if not is_stable(path):
+                continue
+            try:
+                file_mb = os.path.getsize(path) // 1_048_576
+            except OSError:
+                continue
+            if file_mb * 1_048_576 > max_bytes:
+                log(f"skip '{name}': {file_mb} MB exceeds max_upload_mb={cfg.get('max_upload_mb', MAX_UPLOAD_MB_DEFAULT)}")
                 continue
             set_current_upload(name)
             success = upload_file(path, cfg)
@@ -623,6 +688,7 @@ def main():
                 transcripts_done.add(name)
                 save_transcript_state(transcripts_done)
 
+        backfill_channel_names(cfg)
         write_status_cache()
         time.sleep(POLL_SECS)
 

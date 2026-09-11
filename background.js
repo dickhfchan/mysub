@@ -76,6 +76,15 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
     return true;
   }
 
+  if (message.type === 'PUSH_CHANNEL_NAMES') {
+    chrome.runtime.sendNativeMessage(
+      NATIVE_HOST,
+      { action: 'push_channel_names', map: message.map },
+      () => { void chrome.runtime.lastError; }  // fire-and-forget
+    );
+    return false;
+  }
+
   if (message.type === 'SCRAPED_VIDEOS') {
     mergeIntoStorage(message.videos, message.stats)
       .then(newCount => {
