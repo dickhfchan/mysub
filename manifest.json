@@ -2,6 +2,7 @@
   "manifest_version": 3,
   "name": "MySub",
   "version": "0.1.0",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAywzTinwETCx5xoh83epp6t2F9WZWk1GRP/Dxy5oen/KI5/AilpVnzqR9TwF9OJjb4v8EARxcfOBU3BIHwui5+d7a4WuWvIBWnmYwBO8HiYWYfLgid8wd6o8sNOpniaDy721vEFtUpURbyn9K3f6afYWtxAEmP1i1SQWGqoLNkaEj/zf0L0ff7Y+kbvdLyEUlkPdkIshEQswSClZgwXq5ZyBvMv2rdDJV4GcvybiP7IzswwCAe3RDg+YtWYczAq7LL5AKBTkyR/bJZRjj7mZkBN/5oz7SVI48eG3ZWEqx3yYAXpG9B+H9FLNX9ydVA5pcZMoD7g7EcY3zyINXSokPAQIDAQAB",
   "description": "See the latest video from each of your YouTube subscriptions at a glance.",
   "permissions": ["storage", "tabs", "scripting", "nativeMessaging", "sidePanel", "alarms"],
   "host_permissions": ["https://www.youtube.com/*"],
