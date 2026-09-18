@@ -10,6 +10,7 @@ YTDLP        = '/opt/homebrew/bin/yt-dlp'
 DOWNLOAD_DIR = os.path.expanduser('~/Downloads/MySub')
 LOG_FILE     = os.path.expanduser('~/Downloads/MySub/mysub.log')
 QUEUE_PREFIX = os.path.expanduser('~/Downloads/MySub/mysub_queue')
+CONFIG_FILE  = os.path.join(DOWNLOAD_DIR, 'mysub_config.json')
 PARALLEL     = 3  # concurrent yt-dlp workers for batch downloads
 
 # Cache written by the uploader (which has full disk access) so Arc's sandboxed
@@ -41,8 +42,9 @@ def send(obj):
     sys.stdout.buffer.flush()
 
 def cleanup_stale(download_dir):
-    # Remove orphaned numbered audio files left by repeated failed attempts (e.g. filename.f140-5.m4a)
-    for f in glob.glob(os.path.join(download_dir, '*.f*-*.m4a')):
+    # Remove orphaned audio fragments left by failed downloads (e.g. filename.f140.m4a, filename.f140-5.m4a).
+    # These are intermediate files yt-dlp writes before merging; no corresponding .mp4 means they're dead weight.
+    for f in glob.glob(os.path.join(download_dir, '*.f*.m4a')):
         try:
             os.remove(f)
         except OSError:
@@ -118,8 +120,12 @@ def read_status_from_cache():
             if vid_id:
                 statuses[vid_id] = {'dl': None, 'up': 'uploaded'}
 
-        current = cache.get('current')
-        if current:
+        current_raw = cache.get('current')
+        currents = ([current_raw] if isinstance(current_raw, str)
+                    else (current_raw or []))
+        for current in currents:
+            if not current:
+                continue
             m = re.search(r' - ([A-Za-z0-9_-]{11})\.', current)
             if m and m.group(1) not in statuses:
                 vid_id = m.group(1)
@@ -149,7 +155,12 @@ def read_status_from_cache():
             if vid_id and vid_id not in statuses:
                 statuses[vid_id] = {'dl': 'in_queue', 'up': None}
 
-        return statuses, titles, None
+        config = {
+            'wetube_url': cache.get('wetube_url', ''),
+            'max_upload_mb': cache.get('max_upload_mb', 500),
+            'uploader_running': age < CACHE_MAX_AGE,
+        }
+        return statuses, titles, config
     except Exception:
         return None
 
@@ -207,20 +218,32 @@ def main():
             return
         urls = new_urls
 
-        # Write a sidecar .info.json for each video so the uploader can pass
-        # channel name to WeTube without embedding it in the filename.
-        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
-        for url in urls:
-            vid_id = video_id_from_url(url)
-            meta = video_meta.get(url, {})
-            if vid_id and meta:
-                sidecar = os.path.join(DOWNLOAD_DIR, f'mysub_{vid_id}.info.json')
+        # Merge channel names into the persistent lookup so the uploader can
+        # pass channelName to WeTube without per-video sidecar files.
+        channel_names_to_merge = {
+            video_id_from_url(url): video_meta[url].get('channelName', '')
+            for url in urls
+            if video_id_from_url(url) and video_meta.get(url, {}).get('channelName')
+        }
+        if channel_names_to_merge:
+            cache_dir = os.path.expanduser('~/Library/Application Support/MySub')
+            names_file = os.path.join(cache_dir, 'channel_names.json')
+            try:
+                os.makedirs(cache_dir, exist_ok=True)
+                existing = {}
                 try:
-                    with open(sidecar, 'w') as f:
-                        json.dump({'channelName': meta.get('channelName', ''),
-                                   'channelUrl': meta.get('channelUrl', '')}, f)
+                    with open(names_file) as f:
+                        existing = json.load(f)
                 except Exception:
                     pass
+                existing.update(channel_names_to_merge)
+                tmp = names_file + '.tmp'
+                with open(tmp, 'w') as f:
+                    json.dump(existing, f)
+                os.replace(tmp, names_file)
+            except Exception:
+                pass
+        os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
         # Round-robin split: video 0→worker0, 1→worker1, 2→worker2, 3→worker0, ...
         groups = [[] for _ in range(PARALLEL)]
@@ -257,8 +280,9 @@ def main():
     elif action == 'get_status':
         # Try the cache first (accessible from Arc sandbox); fall back to direct scan.
         cache_result = read_status_from_cache()
+        config = {}
         if cache_result:
-            statuses, titles, _ = cache_result
+            statuses, titles, config = cache_result
         else:
             statuses = {}
             titles = {}
@@ -269,8 +293,12 @@ def main():
             uploader_state_file = os.path.join(DOWNLOAD_DIR, 'mysub_uploader_state.json')
             try:
                 with open(uploader_state_file) as f:
-                    current_name = json.load(f).get('current')
-                if current_name:
+                    current_raw = json.load(f).get('current')
+                currents = ([current_raw] if isinstance(current_raw, str)
+                            else (current_raw or []))
+                for current_name in currents:
+                    if not current_name:
+                        continue
                     m = re.search(r' - ([A-Za-z0-9_-]{11})\.', current_name)
                     if m and m.group(1) not in statuses:
                         vid_id = m.group(1)
@@ -313,7 +341,7 @@ def main():
                 except Exception:
                     pass
 
-        send({'status': 'ok', 'statuses': statuses, 'titles': titles})
+        send({'status': 'ok', 'statuses': statuses, 'titles': titles, **config})
 
     elif action == 'push_channel_names':
         # Merge incoming {videoId: channelName} map into the persistent lookup file.
@@ -337,6 +365,22 @@ def main():
             except Exception:
                 pass
         send({'status': 'ok'})
+
+    elif action == 'get_config':
+        try:
+            with open(CONFIG_FILE) as f:
+                cfg = json.load(f)
+            uploader_running = subprocess.run(
+                ['pgrep', '-f', 'mysub_uploader.py'], capture_output=True
+            ).returncode == 0
+            send({
+                'status': 'ok',
+                'wetube_url': cfg.get('wetube_url', ''),
+                'max_upload_mb': cfg.get('max_upload_mb', 500),
+                'uploader_running': uploader_running,
+            })
+        except Exception as e:
+            send({'status': 'error', 'error': str(e)})
 
     elif action == 'download_transcript':
         url = msg.get('url', '')
@@ -362,6 +406,34 @@ def main():
             send({'status': 'started', 'dir': DOWNLOAD_DIR})
         except Exception as e:
             send({'status': 'error', 'error': str(e)})
+
+    elif action == 'restart_if_stalled':
+        # Always poke the uploader so it wakes up and runs cleanup immediately.
+        wakeup = os.path.join(
+            os.path.expanduser('~/Library/Application Support/MySub'),
+            'mysub_wakeup.flag'
+        )
+        try:
+            os.makedirs(os.path.dirname(wakeup), exist_ok=True)
+            open(wakeup, 'w').close()
+        except Exception:
+            pass
+
+        if batch_running():
+            send({'restarted': False, 'reason': 'already_running'})
+        else:
+            queue_files = sorted(glob.glob(QUEUE_PREFIX + '_*.txt'))
+            active = [qf for qf in queue_files if os.path.getsize(qf) > 0]
+            if not active:
+                send({'restarted': False, 'reason': 'no_queue'})
+            else:
+                try:
+                    log = open(LOG_FILE, 'a')
+                    for qf in active:
+                        spawn_yt_dlp(['--batch-file', qf], log)
+                    send({'restarted': True, 'workers': len(active)})
+                except Exception as e:
+                    send({'restarted': False, 'reason': str(e)})
 
     else:
         send({'status': 'error', 'error': f'unknown action: {action}'})

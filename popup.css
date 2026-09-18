@@ -213,14 +213,35 @@ main {
 
 #settings-footer {
   display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 14px;
+  flex-direction: column;
+  gap: 0;
+  padding: 0;
   background: #141414;
   border-top: 1px solid #2a2a2a;
   position: sticky;
   bottom: 0;
 }
+
+#settings-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 14px;
+  flex-wrap: wrap;
+}
+
+#config-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 14px;
+  border-top: 1px solid #1e1e1e;
+  background: #111;
+  font-size: 10px;
+  color: #555;
+}
+
+#config-row .sep { color: #2e2e2e; }
 
 #settings-footer label {
   font-size: 11px;
@@ -264,6 +285,24 @@ main {
   transition: color 0.15s;
 }
 .ext-id:hover { color: #777; }
+
+.config-url {
+  color: #666;
+  text-decoration: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 170px;
+  transition: color 0.15s;
+}
+.config-url:hover { color: #aaa; text-decoration: underline; }
+
+.config-badge {
+  color: #555;
+  white-space: nowrap;
+}
+.config-badge.uploader-on  { color: #4caf50; }
+.config-badge.uploader-off { color: #555; }
 
 /* ── Download button ─────────────────────────────────────── */
 

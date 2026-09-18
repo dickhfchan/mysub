@@ -54,7 +54,14 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
         if (chrome.runtime.lastError || !response || response.status === 'error' || !response.statuses) {
           sendResponse({ ok: false, error: chrome.runtime.lastError?.message ?? response?.error ?? 'no statuses' });
         } else {
-          sendResponse({ ok: true, statuses: response.statuses, titles: response.titles ?? {} });
+          sendResponse({
+            ok: true,
+            statuses: response.statuses,
+            titles: response.titles ?? {},
+            wetube_url: response.wetube_url ?? '',
+            max_upload_mb: response.max_upload_mb ?? 500,
+            uploader_running: response.uploader_running ?? false,
+          });
         }
       }
     );
@@ -70,6 +77,21 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           sendResponse({ status: 'error', error: chrome.runtime.lastError.message });
         } else {
           sendResponse(response ?? { status: 'error', error: 'no response from host' });
+        }
+      }
+    );
+    return true;
+  }
+
+  if (message.type === 'GET_CONFIG') {
+    chrome.runtime.sendNativeMessage(
+      NATIVE_HOST,
+      { action: 'get_config' },
+      (response) => {
+        if (chrome.runtime.lastError || !response || response.status === 'error') {
+          sendResponse({ ok: false });
+        } else {
+          sendResponse({ ok: true, ...response });
         }
       }
     );
@@ -227,6 +249,21 @@ async function handleRefreshRequest() {
   // the _downloadRunning guard that would block if SCRAPED_VIDEOS fired on the same session.
   // The native host's batch_running() check prevents duplicate yt-dlp spawning.
   const dlResult = await _doAutoDownload();
+
+  // If no new downloads were queued, check whether a previous yt-dlp batch stalled
+  // (process died while queue files still have pending URLs) and restart it.
+  let stalledRestart = false;
+  if (dlResult.status !== 'started') {
+    const watchdog = await new Promise(resolve => {
+      chrome.runtime.sendNativeMessage(
+        NATIVE_HOST,
+        { action: 'restart_if_stalled' },
+        r => resolve(r ?? {})
+      );
+    });
+    stalledRestart = watchdog.restarted === true;
+  }
+
   const { channels = {} } = await chrome.storage.local.get('channels');
 
   return {
@@ -236,6 +273,7 @@ async function handleRefreshRequest() {
     stats: scrapeResult.stats,
     downloadQueued: dlResult.queued,
     downloadStatus: dlResult.status,
+    stalledRestart,
   };
 }
 

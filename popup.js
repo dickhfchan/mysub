@@ -120,6 +120,7 @@ async function fetchStatus() {
     if (!response?.ok) return;
     statusMap = response.statuses;
     applyStatuses(statusMap);
+    renderConfigRow(response);
     await syncDownloadBatch(response.statuses, response.titles ?? {});
   } catch (e) {
     // silent — status chips are best-effort
@@ -380,6 +381,8 @@ async function handleRefresh() {
     setStatusFromStats(response.stats, response.totalChannels ?? Object.keys(channels).length);
     if (response.downloadStatus === 'started') {
       showToast(`Queued ${response.downloadQueued} video${response.downloadQueued === 1 ? '' : 's'} for download`);
+    } else if (response.stalledRestart) {
+      showToast('Download was stalled — restarted');
     } else if (response.downloadStatus === 'nothing') {
       showToast('No new videos to download');
     } else if (response.downloadStatus === 'already_running') {
@@ -400,6 +403,21 @@ function showToast(message) {
   toast.textContent = message;
   toast.classList.add('visible');
   setTimeout(() => toast.classList.remove('visible'), 3200);
+}
+
+function renderConfigRow(r) {
+  const urlEl = document.getElementById('config-url');
+  const mbEl  = document.getElementById('config-max-mb');
+  const upEl  = document.getElementById('config-uploader');
+  if (r.wetube_url) {
+    urlEl.textContent = r.wetube_url.replace(/^https?:\/\//, '');
+    urlEl.href = r.wetube_url;
+  }
+  if (r.max_upload_mb != null) mbEl.textContent = `max ${r.max_upload_mb} MB`;
+  if (r.uploader_running != null) {
+    upEl.textContent = r.uploader_running ? 'uploader ▲' : 'uploader ▼';
+    upEl.className   = `config-badge ${r.uploader_running ? 'uploader-on' : 'uploader-off'}`;
+  }
 }
 
 // Build {videoId: channelName} from both storage sources and push to native host

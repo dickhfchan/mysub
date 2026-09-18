@@ -18,8 +18,10 @@ import ssl
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 try:
     import certifi
@@ -40,8 +42,20 @@ QUEUE_PREFIX      = os.path.join(DOWNLOAD_DIR, 'mysub_queue')
 STATUS_CACHE_DIR   = os.path.expanduser('~/Library/Application Support/MySub')
 STATUS_CACHE_FILE  = os.path.join(STATUS_CACHE_DIR, 'status_cache.json')
 CHANNEL_NAMES_FILE = os.path.join(STATUS_CACHE_DIR, 'channel_names.json')
+WAKEUP_FLAG        = os.path.join(STATUS_CACHE_DIR, 'mysub_wakeup.flag')
 FFPROBE      = '/opt/homebrew/bin/ffprobe'
 FFMPEG       = '/opt/homebrew/bin/ffmpeg'
+YTDLP        = '/opt/homebrew/bin/yt-dlp'
+YTDLP_FLAGS  = [
+    '-f', 'bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1]+bestaudio/bestvideo+bestaudio[ext=m4a]/bestvideo+bestaudio/best',
+    '--merge-output-format', 'mp4',
+    '--ffmpeg-location', FFMPEG,
+    '-o', os.path.join(DOWNLOAD_DIR, '%(title)s - %(id)s.%(ext)s'),
+    '--continue',
+    '--no-overwrites',
+    '--match-filter', '!is_live',
+    '--retries', '3',
+]
 STABLE_SECS  = 60    # file must be unmodified this long before upload
 POLL_SECS    = 600   # check every 10 minutes
 
@@ -56,6 +70,35 @@ def log(msg):
 
 
 MAX_UPLOAD_MB_DEFAULT = 500
+UPLOAD_WORKERS        = 3
+
+# Thread-safe set of filenames currently being uploaded
+_current_lock   = threading.Lock()
+_current_uploads: set = set()
+
+
+def _flush_uploader_state():
+    with _current_lock:
+        lst = sorted(_current_uploads)
+    try:
+        with open(UPLOADER_STATE, 'w') as f:
+            json.dump({'current': lst}, f)
+    except Exception:
+        pass
+
+
+def _add_current(name):
+    with _current_lock:
+        _current_uploads.add(name)
+    _flush_uploader_state()
+    write_status_cache()
+
+
+def _remove_current(name):
+    with _current_lock:
+        _current_uploads.discard(name)
+    _flush_uploader_state()
+    write_status_cache()
 
 def load_config():
     if not os.path.exists(CONFIG_FILE):
@@ -104,13 +147,11 @@ def save_transcript_state(uploaded):
 
 
 def set_current_upload(filename):
-    """Write the currently-uploading filename to the state file (None to clear)."""
-    try:
-        with open(UPLOADER_STATE, 'w') as f:
-            json.dump({'current': filename}, f)
-    except Exception:
-        pass
-    write_status_cache()
+    """Kept for compatibility — prefer _add_current/_remove_current."""
+    if filename:
+        _add_current(filename)
+    else:
+        write_status_cache()
 
 
 def write_status_cache():
@@ -130,12 +171,8 @@ def write_status_cache():
         except Exception:
             pass
 
-        current_name = None
-        try:
-            with open(UPLOADER_STATE) as f:
-                current_name = json.load(f).get('current')
-        except Exception:
-            pass
+        with _current_lock:
+            current_list = sorted(_current_uploads)
 
         mp4s = [os.path.basename(p) for p in glob.glob(os.path.join(DOWNLOAD_DIR, '*.mp4'))
                 if not re.search(r'\.f\d+\.mp4$', os.path.basename(p))]
@@ -153,17 +190,30 @@ def write_status_cache():
             except Exception:
                 pass
 
+        cfg_info = {}
+        try:
+            with open(CONFIG_FILE) as f:
+                _cfg = json.load(f)
+            cfg_info = {
+                'wetube_url': _cfg.get('wetube_url', ''),
+                'max_upload_mb': _cfg.get('max_upload_mb', MAX_UPLOAD_MB_DEFAULT),
+            }
+        except Exception:
+            pass
+
         cache = {
             'uploaded': uploaded_names,
-            'current': current_name,
+            'current': current_list,
             'mp4s': mp4s,
             'parts': parts,
             'queued_urls': queued_urls,
             'written_at': time.time(),
+            **cfg_info,
         }
 
-        tmp = STATUS_CACHE_FILE + '.tmp'
-        with open(tmp, 'w') as f:
+        import tempfile as _tf
+        fd, tmp = _tf.mkstemp(dir=STATUS_CACHE_DIR, suffix='.tmp')
+        with os.fdopen(fd, 'w') as f:
             json.dump(cache, f)
         os.replace(tmp, STATUS_CACHE_FILE)
     except Exception:
@@ -385,23 +435,36 @@ def api_post(base_url, endpoint, key, body):
 
 
 def put_bytes(url_str, data, content_type, extra_headers=None):
-    """PUT raw bytes to a presigned URL (used for small thumbnail upload)."""
+    """PUT raw bytes to a presigned URL, with up to 3 attempts."""
     parsed = urllib.parse.urlparse(url_str)
     headers = {
         'Content-Type': content_type,
         'Content-Length': str(len(data)),
         **(extra_headers or {}),
     }
-    if parsed.scheme == 'https':
-        conn = http.client.HTTPSConnection(parsed.netloc, timeout=60, context=_SSL_CTX)
-    else:
-        conn = http.client.HTTPConnection(parsed.netloc, timeout=60)
-    conn.request('PUT', parsed.path + ('?' + parsed.query if parsed.query else ''), data, headers)
-    resp = conn.getresponse()
-    status = resp.status
-    resp.read()
-    conn.close()
-    return status
+    path_qs = parsed.path + ('?' + parsed.query if parsed.query else '')
+    last_exc = None
+    for attempt in range(3):
+        try:
+            if parsed.scheme == 'https':
+                conn = http.client.HTTPSConnection(parsed.netloc, timeout=60, context=_SSL_CTX)
+            else:
+                conn = http.client.HTTPConnection(parsed.netloc, timeout=60)
+            conn.request('PUT', path_qs, data, headers)
+            resp = conn.getresponse()
+            status = resp.status
+            resp.read()
+            conn.close()
+            return status
+        except Exception as e:
+            last_exc = e
+            try:
+                conn.close()
+            except Exception:
+                pass
+            if attempt < 2:
+                time.sleep(10 * (attempt + 1))
+    raise last_exc
 
 
 def stream_put(url_str, file_path, extra_headers=None):
@@ -451,20 +514,11 @@ def stream_put(url_str, file_path, extra_headers=None):
 
 
 def read_sidecar(path):
-    """Return channel metadata for this video from sidecar or channel_names.json fallback."""
+    """Return channel metadata for this video from channel_names.json."""
     m = re.search(r' - ([A-Za-z0-9_-]{11})\.[^.]+$', os.path.basename(path))
     if not m:
         return {}
     vid_id = m.group(1)
-    sidecar = os.path.join(DOWNLOAD_DIR, f'mysub_{vid_id}.info.json')
-    try:
-        with open(sidecar) as f:
-            data = json.load(f)
-        if data.get('channelName'):
-            return data
-    except Exception:
-        pass
-    # Fallback: channel_names.json written by native host from extension storage
     try:
         with open(CHANNEL_NAMES_FILE) as f:
             names = json.load(f)
@@ -629,14 +683,98 @@ def acquire_lock():
     return None
 
 
+def _upload_one(path, cfg, uploaded, state_lock):
+    """Upload one mp4 concurrently. Manages _current_uploads and saves state."""
+    name = os.path.basename(path)
+    _add_current(name)
+    try:
+        success = upload_file(path, cfg)
+    finally:
+        _remove_current(name)
+
+    if success:
+        try:
+            os.remove(path)
+            log(f"deleted local copy: {name}")
+        except OSError as e:
+            log(f"could not delete {name}: {e}")
+        with state_lock:
+            uploaded.add(name)
+            save_state(uploaded)
+    return success
+
+
+def cleanup_stale_mp4s(uploaded, max_bytes):
+    """Delete mp4s that are already uploaded (re-downloaded) or too large to ever upload."""
+    for path in glob.glob(os.path.join(DOWNLOAD_DIR, '*.mp4')):
+        name = os.path.basename(path)
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            continue
+        if name in uploaded:
+            try:
+                os.remove(path)
+                log(f"removed re-downloaded duplicate: {name[:70]}")
+            except OSError as e:
+                log(f"could not remove duplicate {name}: {e}")
+        elif size > max_bytes:
+            try:
+                os.remove(path)
+                log(f"removed oversized ({size // 1_048_576} MB): {name[:70]}")
+            except OSError as e:
+                log(f"could not remove oversized {name}: {e}")
+
+
+def poll_sleep(secs):
+    """Sleep for up to secs seconds, waking early if the wakeup flag is written."""
+    deadline = time.time() + secs
+    while time.time() < deadline:
+        if os.path.exists(WAKEUP_FLAG):
+            try:
+                os.remove(WAKEUP_FLAG)
+            except OSError:
+                pass
+            return
+        time.sleep(30)
+
+
+def ytdlp_running():
+    return subprocess.run(['pgrep', '-f', QUEUE_PREFIX], capture_output=True).returncode == 0
+
+
+def maybe_restart_ytdlp():
+    """Restart yt-dlp workers if queue files have pending URLs but no downloader is running."""
+    if ytdlp_running():
+        return
+    queue_files = sorted(glob.glob(QUEUE_PREFIX + '_*.txt'))
+    active = [qf for qf in queue_files if os.path.getsize(qf) > 0]
+    if not active:
+        return
+    log(f"queue files present but no downloader running — restarting yt-dlp for {len(active)} queue(s)")
+    try:
+        dl_log = open(os.path.join(DOWNLOAD_DIR, 'mysub.log'), 'a')
+        env = os.environ.copy()
+        env['PYTHONUNBUFFERED'] = '1'
+        for qf in active:
+            subprocess.Popen(
+                [YTDLP] + YTDLP_FLAGS + ['--batch-file', qf],
+                stdout=dl_log, stderr=dl_log, env=env,
+                start_new_session=True,
+            )
+    except Exception as e:
+        log(f"failed to restart yt-dlp: {e}")
+
+
 def main():
     lock = acquire_lock()
     if lock is None:
         log("another uploader instance is running — exiting")
         return
-    log("uploader started")
+    log(f"uploader started (parallel_uploads={UPLOAD_WORKERS})")
     uploaded = load_state()
     transcripts_done = load_transcript_state()
+    state_lock = threading.Lock()
 
     while True:
         cfg = load_config()
@@ -646,10 +784,17 @@ def main():
             continue
 
         max_bytes = int(cfg.get('max_upload_mb', MAX_UPLOAD_MB_DEFAULT)) * 1024 * 1024
+
+        with state_lock:
+            cleanup_stale_mp4s(set(uploaded), max_bytes)
+
+        # Collect stable mp4s not yet uploaded
+        pending = []
         for path in sorted(glob.glob(os.path.join(DOWNLOAD_DIR, '*.mp4'))):
             name = os.path.basename(path)
-            if name in uploaded:
-                continue
+            with state_lock:
+                if name in uploaded:
+                    continue
             if not is_stable(path):
                 continue
             try:
@@ -659,24 +804,17 @@ def main():
             if file_mb * 1_048_576 > max_bytes:
                 log(f"skip '{name}': {file_mb} MB exceeds max_upload_mb={cfg.get('max_upload_mb', MAX_UPLOAD_MB_DEFAULT)}")
                 continue
-            set_current_upload(name)
-            success = upload_file(path, cfg)
-            set_current_upload(None)
-            if success:
-                try:
-                    os.remove(path)
-                    log(f"deleted local copy: {name}")
-                except OSError as e:
-                    log(f"could not delete {name}: {e}")
-                # Clean up sidecar
-                m = re.search(r' - ([A-Za-z0-9_-]{11})\.[^.]+$', name)
-                if m:
+            pending.append(path)
+
+        if pending:
+            with ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as executor:
+                futures = {executor.submit(_upload_one, p, cfg, uploaded, state_lock): p
+                           for p in pending}
+                for fut in as_completed(futures):
                     try:
-                        os.remove(os.path.join(DOWNLOAD_DIR, f'mysub_{m.group(1)}.info.json'))
-                    except OSError:
-                        pass
-                uploaded.add(name)
-                save_state(uploaded)
+                        fut.result()
+                    except Exception as e:
+                        log(f"upload thread error for '{os.path.basename(futures[fut])}': {e}")
 
         for path in sorted(glob.glob(os.path.join(DOWNLOAD_DIR, '*.*.vtt'))):
             name = os.path.basename(path)
@@ -688,9 +826,10 @@ def main():
                 transcripts_done.add(name)
                 save_transcript_state(transcripts_done)
 
+        maybe_restart_ytdlp()
         backfill_channel_names(cfg)
         write_status_cache()
-        time.sleep(POLL_SECS)
+        poll_sleep(POLL_SECS)
 
 
 if __name__ == '__main__':
